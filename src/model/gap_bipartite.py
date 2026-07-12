@@ -268,7 +268,7 @@ if __name__ == "__main__":
     else:  # pragma: no cover
         import sys
         sys.path.insert(0, ".")
-        from src.data.gap_dataset import build_gap_sample
+        from src.dataset.gap_dataset import build_gap_sample
 
         sample = build_gap_sample(n_agents=4, n_tasks=8, seed=0)
         data = gap_sample_to_hetero_data(sample, step=0)

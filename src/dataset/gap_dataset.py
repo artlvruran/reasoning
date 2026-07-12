@@ -20,7 +20,7 @@ from typing import Optional
 
 import numpy as np
 
-from src.algorithms.gap_pd import (
+from src.dataset.algorithms.gap_pd import (
     GAPInstance,
     generate_gap_instance,
     solve_gap_exact,
