@@ -4,10 +4,25 @@ Trains the actor to match an expert action distribution pi_expert(.|s) by
 minimising KL(pi || pi_expert) (equivalently, since pi_expert is a discrete
 distribution over a masked action set, this reduces to a cross-entropy-like
 objective weighted by the expert probabilities).
+
+Training is done with **real vectorised minibatches**: examples are grouped
+by node count (so every example in a group shares an action-space size),
+each group's edge lists are zero-padded to a common length within the
+group (`gnarl.envs.base.pad_state_to`, with the padding edges excluded from
+message aggregation via an `edge_valid` mask), and a whole minibatch is
+processed in a single `jax.vmap`'d forward pass (`gnarl.model.forward_batched`).
+This is far faster, and yields much less noisy gradients, than dispatching
+one small forward/backward pass per example. This matters in practice: with
+only per-example SGD and a handful of epochs, GNARL under-fits badly (loss
+plateaus well above the expert's own entropy, and greedy-rollout accuracy on
+held-out graphs can be close to 0%) simply because too few effective
+gradient updates have been taken -- real minibatching lets many more epochs
+run in the same wall-clock budget.
 """
 from __future__ import annotations
 
-import time
+import random
+from collections import defaultdict
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import jax
@@ -15,7 +30,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from ..model import GNARLConfig, forward, init_params
+from ..envs.base import GraphState, pad_state_to, stack_states
+from ..model import GNARLConfig, forward, forward_batched, init_params
 
 
 class Trajectory:
@@ -57,42 +73,70 @@ def collect_bc_dataset(env_factory, graphs, expert_setup: Optional[Callable] = N
     return data
 
 
-def _kl_loss(params, cfg: GNARLConfig, state, expert_probs):
+def _kl_loss_single(params, cfg: GNARLConfig, state, expert_probs):
     out = forward(params, cfg, state)
     log_probs = jax.nn.log_softmax(out["logits"])
     expert_probs = jnp.asarray(expert_probs)
     expert_probs = expert_probs / jnp.clip(expert_probs.sum(), 1e-8)
-    # cross-entropy between expert distribution and predicted distribution;
-    # equivalent (up to the expert's own constant entropy) to Eq. 3's KL term.
     return -jnp.sum(expert_probs * log_probs)
+
+
+def _kl_loss_batched(params, cfg: GNARLConfig, batched_state, expert_probs_batch):
+    out = forward_batched(params, cfg, batched_state)
+    log_probs = jax.nn.log_softmax(out["logits"], axis=-1)
+    ep = expert_probs_batch / jnp.clip(expert_probs_batch.sum(axis=-1, keepdims=True), 1e-8)
+    per_example = -jnp.sum(ep * log_probs, axis=-1)
+    return jnp.mean(per_example)
+
+
+def _make_minibatches(dataset: List[Trajectory], batch_size: int, rng: np.random.Generator):
+    """Groups trajectories by n_nodes (so each group shares an action-space
+    size), shuffles within each group, and yields padded/stacked minibatches
+    of (batched_state, expert_probs_batch)."""
+    by_n = defaultdict(list)
+    for traj in dataset:
+        by_n[traj.state.n_nodes].append(traj)
+
+    batches = []
+    for n_nodes, trajs in by_n.items():
+        order = rng.permutation(len(trajs))
+        for start in range(0, len(trajs), batch_size):
+            idx = order[start:start + batch_size]
+            group = [trajs[i] for i in idx]
+            max_m = max(t.state.edge_index.shape[1] for t in group)
+            padded = [pad_state_to(t.state, max_m) for t in group]
+            batched_state = stack_states(padded)
+            expert_probs_batch = jnp.stack([jnp.asarray(t.expert_probs, dtype=jnp.float32) for t in group])
+            batches.append((batched_state, expert_probs_batch))
+    return batches
 
 
 def train_bc(cfg: GNARLConfig, dataset: List[Trajectory], key: jax.Array,
              epochs: int = 20, lr: float = 1e-3, batch_size: int = 16,
-             params=None, verbose: bool = True):
+             params=None, verbose: bool = True, grad_clip: float = 5.0):
     if params is None:
         params = init_params(key, cfg)
-    opt = optax.adam(lr)
+    opt = optax.chain(optax.clip_by_global_norm(grad_clip), optax.adam(lr))
     opt_state = opt.init(params)
 
-    loss_and_grad = jax.jit(jax.value_and_grad(_kl_loss), static_argnums=(1,))
+    loss_and_grad = jax.jit(jax.value_and_grad(_kl_loss_batched), static_argnums=(1,))
 
-    n = len(dataset)
+    rng = np.random.default_rng(0)
     history = []
-    idxs = np.arange(n)
+    n = len(dataset)
     for epoch in range(epochs):
-        np.random.shuffle(idxs)
+        batches = _make_minibatches(dataset, batch_size, rng)
+        random.shuffle(batches)
         epoch_loss = 0.0
-        for start in range(0, n, batch_size):
-            batch_idx = idxs[start:start + batch_size]
-            for i in batch_idx:
-                traj = dataset[i]
-                loss, grads = loss_and_grad(params, cfg, traj.state, traj.expert_probs)
-                updates, opt_state = opt.update(grads, opt_state, params)
-                params = optax.apply_updates(params, updates)
-                epoch_loss += float(loss)
-        epoch_loss /= max(n, 1)
+        n_batches = 0
+        for batched_state, expert_probs_batch in batches:
+            loss, grads = loss_and_grad(params, cfg, batched_state, expert_probs_batch)
+            updates, opt_state = opt.update(grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+            epoch_loss += float(loss)
+            n_batches += 1
+        epoch_loss /= max(n_batches, 1)
         history.append(epoch_loss)
         if verbose and (epoch % max(1, epochs // 10) == 0 or epoch == epochs - 1):
-            print(f"  [BC] epoch {epoch+1}/{epochs}  loss={epoch_loss:.4f}")
+            print(f"  [BC] epoch {epoch+1}/{epochs}  loss={epoch_loss:.4f}  ({n_batches} minibatches, {n} examples)")
     return params, history

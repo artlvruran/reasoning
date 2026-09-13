@@ -70,6 +70,27 @@ class _BFSDFSBase(GNARLEnv):
             if psi1 is not None:
                 for v in self.neighbours(psi1):
                     mask[v] = True
+                # Selecting psi_1 itself (a harmless self-loop transition,
+                # pred[psi_1] stays psi_1) is only ever the *expert's*
+                # recommendation in one specific, narrow circumstance: DFS's
+                # Algorithm 10 falls back to it when psi_1's real neighbours
+                # are *all* already visited but psi_1's own `reach` flag has
+                # not yet been set (it is only set retroactively, on the
+                # *next* phase-2 transition -- see Algorithm 1). We add it to
+                # the mask only in that exact situation, rather than
+                # unconditionally: unconditionally offering a "pick myself"
+                # action on every phase-2 decision gives the policy a
+                # persistent, never-useful distractor to rule out on every
+                # single step, which empirically makes BFS (whose expert,
+                # Algorithm 9, *never* needs this fallback at all) much
+                # harder to fit well -- the model would frequently end up
+                # splitting probability ~50/50 between the correct neighbour
+                # and this spurious self-loop option even after extensive
+                # training.
+                reach = self.node_feat["reach"][:, 0].astype(bool)
+                real_neighbours_all_visited = mask.any() and reach[mask].all()
+                if real_neighbours_all_visited and not reach[psi1]:
+                    mask[psi1] = True
             if not mask.any():
                 mask[:] = True  # degenerate isolated node fallback
         return mask
@@ -191,21 +212,32 @@ class BFSEnv(_BFSDFSBase):
         if len(dist) != self.n:
             return False
         depths = {}
+        in_progress = set()
 
         def get_depth(v):
             if v in depths:
                 return depths[v]
+            if v in in_progress:
+                # Cycle in `pred` (should not occur for a valid tree, but a
+                # poorly trained/rolled-out policy can produce one) --
+                # signal invalidity rather than recursing forever.
+                raise ValueError("cycle in pred")
+            in_progress.add(v)
             if self.pred[v] == v:
                 depths[v] = 0
             else:
                 depths[v] = get_depth(int(self.pred[v])) + 1
+            in_progress.discard(v)
             return depths[v]
 
-        for v in range(self.n):
-            if get_depth(v) != dist[v]:
-                return False
-            if self.pred[v] != v and not self.G.has_edge(int(self.pred[v]), v):
-                return False
+        try:
+            for v in range(self.n):
+                if get_depth(v) != dist[v]:
+                    return False
+                if self.pred[v] != v and not self.G.has_edge(int(self.pred[v]), v):
+                    return False
+        except ValueError:
+            return False
         return True
 
     def objective(self) -> float:
@@ -290,7 +322,15 @@ def _check_valid_dfs_forest(G: nx.Graph, pred: np.ndarray, n: int) -> bool:
 
     def is_descendant(v, root, active_nodes):
         cur = v
+        seen = set()
         while cur in active_nodes and cur != root:
+            if cur in seen:
+                # A cycle in `pred` (which should never happen for a
+                # genuinely valid forest, but can arise from a poorly
+                # trained/rollout policy that revisits nodes) -- treat as
+                # "not a descendant" rather than looping forever.
+                return False
+            seen.add(cur)
             nxt = int(pred[cur])
             if nxt == cur:
                 return False
@@ -307,7 +347,11 @@ def _check_valid_dfs_forest(G: nx.Graph, pred: np.ndarray, n: int) -> bool:
             subroot_of = {}
             for v in active_nodes:
                 cur = v
+                seen = set()
                 while cur not in subroots:
+                    if cur in seen:
+                        return False  # cycle in pred among active_nodes
+                    seen.add(cur)
                     cur = int(pred[cur])
                 subroot_of[v] = cur
             Gcomp = nx.Graph()

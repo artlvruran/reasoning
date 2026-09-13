@@ -32,6 +32,15 @@ class GraphState:
     edge_feats: Dict[str, jnp.ndarray]
     graph_feats: Dict[str, jnp.ndarray]
     action_mask: jnp.ndarray  # (n,) bool
+    edge_valid: Optional[jnp.ndarray] = None  # (m,) float32, 1 for real edges,
+    # 0 for padding edges introduced when batching variable-sized graphs
+    # together (see `pad_state_to`/`stack_states` below). `None` means "all
+    # edges are real", i.e. the common, un-padded case.
+
+    def __post_init__(self):
+        if self.edge_valid is None:
+            m = self.edge_index.shape[1]
+            self.edge_valid = jnp.ones((m,), dtype=jnp.float32)
 
 
 def _graphstate_flatten(gs: "GraphState"):
@@ -44,6 +53,7 @@ def _graphstate_flatten(gs: "GraphState"):
         tuple(gs.edge_feats[k] for k in edge_keys),
         tuple(gs.graph_feats[k] for k in graph_keys),
         gs.action_mask,
+        gs.edge_valid,
     )
     aux = (gs.n_nodes, node_keys, edge_keys, graph_keys)
     return children, aux
@@ -51,7 +61,7 @@ def _graphstate_flatten(gs: "GraphState"):
 
 def _graphstate_unflatten(aux, children):
     n_nodes, node_keys, edge_keys, graph_keys = aux
-    edge_index, node_vals, edge_vals, graph_vals, action_mask = children
+    edge_index, node_vals, edge_vals, graph_vals, action_mask, edge_valid = children
     return GraphState(
         n_nodes=n_nodes,
         edge_index=edge_index,
@@ -59,11 +69,65 @@ def _graphstate_unflatten(aux, children):
         edge_feats=dict(zip(edge_keys, edge_vals)),
         graph_feats=dict(zip(graph_keys, graph_vals)),
         action_mask=action_mask,
+        edge_valid=edge_valid,
     )
 
 
 import jax
 jax.tree_util.register_pytree_node(GraphState, _graphstate_flatten, _graphstate_unflatten)
+
+
+def pad_state_to(state: "GraphState", max_m: int) -> "GraphState":
+    """Pads a GraphState's edge arrays up to `max_m` edges, so that states
+    from graphs with differing edge counts (but the same node count) can be
+    stacked into a single batch and processed with `jax.vmap`. Padding
+    edges are routed to node 0 with all-zero features and marked invalid
+    via `edge_valid`, so `_segment_agg` (sum/max aggregation) is unaffected
+    (see `gnarl.model._process`)."""
+    m = state.edge_index.shape[1]
+    if m == max_m:
+        return state
+    pad = max_m - m
+    if pad < 0:
+        raise ValueError(f"max_m={max_m} smaller than existing m={m}")
+    pad_index = jnp.zeros((2, pad), dtype=state.edge_index.dtype)
+    new_edge_index = jnp.concatenate([state.edge_index, pad_index], axis=1)
+    new_edge_feats = {
+        k: jnp.concatenate([v, jnp.zeros((pad,) + v.shape[1:], dtype=v.dtype)], axis=0)
+        for k, v in state.edge_feats.items()
+    }
+    new_edge_valid = jnp.concatenate([
+        jnp.asarray(state.edge_valid, dtype=jnp.float32),
+        jnp.zeros((pad,), dtype=jnp.float32),
+    ])
+    return GraphState(
+        n_nodes=state.n_nodes,
+        edge_index=new_edge_index,
+        node_feats=state.node_feats,
+        edge_feats=new_edge_feats,
+        graph_feats=state.graph_feats,
+        action_mask=state.action_mask,
+        edge_valid=new_edge_valid,
+    )
+
+
+def stack_states(states: List["GraphState"]) -> "GraphState":
+    """Stacks a list of same-n_nodes, same-max-edge-count GraphStates (after
+    `pad_state_to`) into a single batched GraphState whose leaves gain a
+    leading batch dimension -- suitable for `jax.vmap(forward, in_axes=(None, None, 0))`."""
+    n_nodes = states[0].n_nodes
+    node_keys = states[0].node_feats.keys()
+    edge_keys = states[0].edge_feats.keys()
+    graph_keys = states[0].graph_feats.keys()
+    return GraphState(
+        n_nodes=n_nodes,
+        edge_index=jnp.stack([s.edge_index for s in states]),
+        node_feats={k: jnp.stack([s.node_feats[k] for s in states]) for k in node_keys},
+        edge_feats={k: jnp.stack([s.edge_feats[k] for s in states]) for k in edge_keys},
+        graph_feats={k: jnp.stack([s.graph_feats[k] for s in states]) for k in graph_keys},
+        action_mask=jnp.stack([s.action_mask for s in states]),
+        edge_valid=jnp.stack([jnp.asarray(s.edge_valid, dtype=jnp.float32) for s in states]),
+    )
 
 
 class GNARLEnv:
