@@ -27,6 +27,7 @@ class Config:
     # --- model ---
     h: int = 128
     temp_on_eval: float = 0.
+    use_relaxation_fts: bool = True
 
     num_node_states: int = 1
     num_edge_states: int = 1

@@ -63,6 +63,13 @@ class AttentionModule(torch.nn.Module):
         self.static_fts_encoder = StatesEncoder(h, 2)
         self.combine_fts = Linear(3 * h, h, bias=False)
 
+        # rlx/rlx_d in compute_static_fts assume a monotone relaxation invariant
+        # (node scalar = best cost so far, as in Dijkstra/MST). tsp/tsp_exact
+        # overwrite the scalar every step instead of relaxing it, so the
+        # feature is a noisy, non-monotone signal there. This flag lets us
+        # ablate it to test whether it hurts convergence on such algorithms.
+        self.use_relaxation_fts = config.use_relaxation_fts
+
         self.use_noise = config.use_noise
         self.temp = (
             config.processor_upper_t,
@@ -129,7 +136,11 @@ class AttentionModule(torch.nn.Module):
             node_states[batch.edge_index[0]], scalars, batch.edge_index[1]
         )
 
-        static_fts = self.compute_static_fts(scalars, batch)
+        if self.use_relaxation_fts:
+            static_fts = self.compute_static_fts(scalars, batch)
+        else:
+            static_fts = torch.zeros_like(edge_fts)
+
         combined = self.combine_fts(
             torch.cat(
                 [edge_fts, edge_fts[batch.batched_reverse_idx], static_fts], dim=1
