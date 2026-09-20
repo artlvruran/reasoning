@@ -1,0 +1,21 @@
+algorithm: tsp_exact
+
+# --- data ---
+# NB: tsp_exact hints are computed via Held-Karp DP, O(n^2 * 2^n). Keep
+# problem_size small (see generate_data.MAX_EXACT_TSP_SIZE); ~3ms/instance
+# at n=10, ~270ms/instance at n=15.
+num_samples:
+  train: 10000
+  val: 320
+  test: 320
+
+problem_size:
+  train: 10
+  val: 10
+  test: 10
+
+edge_weights: true
+
+# --- model ---
+num_node_states: 2
+num_edge_states: 2
